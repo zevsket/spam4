@@ -3,6 +3,7 @@ import random
 import json
 from datetime import datetime
 from telethon import TelegramClient, events, Button
+from telethon.sessions import StringSession
 from telethon.tl.types import (
     PeerChannel, PeerChat, PeerUser,
     InputPeerChannel, InputPeerChat, InputPeerUser,
