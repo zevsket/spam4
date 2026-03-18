@@ -2,49 +2,41 @@ import asyncio
 import random
 import json
 from datetime import datetime
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from pyrogram.errors import (
-    PeerIdInvalid, UsernameInvalid, ChatAdminRequired,
-    UserAlreadyParticipant, InviteHashExpired, FloodWait,
-    SessionPasswordNeeded
+from telethon import TelegramClient, events, Button
+from telethon.tl.types import (
+    PeerChannel, PeerChat, PeerUser,
+    InputPeerChannel, InputPeerChat, InputPeerUser,
+    DialogFilter
 )
+from telethon.tl.functions.messages import GetDialogFiltersRequest
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import API_ID, API_HASH, BOT_TOKEN, MIN_DELAY, MAX_DELAY
+from config import API_ID, API_HASH, BOT_TOKEN
 from database import init_db, User, Account, SpamTask
 
-# Инициализация бота
-app = Client(
-    "spam_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
+# Инициализация бота (Telethon)
+bot = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# Хранилище активных задач
+# Хранилище активных задач и сессий пользователей
 active_tasks = {}
 user_sessions = {}
+user_folders_cache = {}  # Кэш папок пользователя {user_id: [folders]}
 
 # ========== БАЗОВЫЕ ФУНКЦИИ ==========
 
-async def get_or_create_user(session: AsyncSession, telegram_id: int):
-    """Получить или создать пользователя"""
-    result = await session.execute(
-        select(User).where(User.telegram_id == telegram_id)
-    )
-    user = result.scalar_one_or_none()
-    
-    if not user:
-        user = User(telegram_id=telegram_id)
-        session.add(user)
-        await session.commit()
-    
-    return user
+async def get_or_create_user(user_id: int):
+    async with await init_db() as session:
+        result = await session.execute(select(User).where(User.telegram_id == user_id))
+        user = result.scalar_one_or_none()
+        if not user:
+            user = User(telegram_id=user_id)
+            session.add(user)
+            await session.commit()
+        return user
 
 async def save_session(user_id: int, phone: str, session_string: str):
-    """Сохранить сессию аккаунта"""
     async with await init_db() as session:
         account = Account(
             user_id=user_id,
@@ -56,202 +48,225 @@ async def save_session(user_id: int, phone: str, session_string: str):
         return account
 
 async def get_user_accounts(user_id: int):
-    """Получить аккаунты пользователя"""
     async with await init_db() as session:
-        result = await session.execute(
-            select(Account).where(Account.user_id == user_id)
-        )
+        result = await session.execute(select(Account).where(Account.user_id == user_id))
         return result.scalars().all()
 
-async def get_chats_from_folder(user_client: Client, folder_name: str):
-    """Получить все чаты из указанной папки"""
+async def get_account_by_id(account_id: int):
+    async with await init_db() as session:
+        result = await session.execute(select(Account).where(Account.id == account_id))
+        return result.scalar_one_or_none()
+
+# ========== ПОЛУЧЕНИЕ ПАПОК ЧЕРЕЗ TELETHON ==========
+
+async def get_folders_with_chats(client: TelegramClient):
+    """Получает все папки и чаты в них"""
     try:
-        # Получаем все диалоги
-        dialogs = []
-        async for dialog in user_client.get_dialogs():
-            dialogs.append(dialog)
+        # Получаем все папки
+        result = await client(GetDialogFiltersRequest())
+        folders = []
         
-        # Получаем информацию о папках
-        folders = await user_client.get_folders()
-        
-        # Ищем нужную папку
-        target_folder = None
-        for folder in folders:
-            if folder.title.lower() == folder_name.lower():
-                target_folder = folder
-                break
-        
-        if not target_folder:
-            return None, f"Папка '{folder_name}' не найдена"
-        
-        # Собираем чаты из папки
-        folder_chats = []
-        for peer in target_folder.included_peers:
-            try:
-                # Получаем информацию о чате
-                if hasattr(peer, 'channel_id'):
-                    chat = await user_client.get_chat(peer.channel_id)
-                elif hasattr(peer, 'chat_id'):
-                    chat = await user_client.get_chat(peer.chat_id)
-                elif hasattr(peer, 'user_id'):
-                    chat = await user_client.get_chat(peer.user_id)
-                else:
-                    continue
-                
-                folder_chats.append({
-                    'id': chat.id,
-                    'title': chat.title or f"{chat.first_name} {chat.last_name or ''}",
-                    'username': chat.username
-                })
-            except Exception as e:
+        for i, folder in enumerate(result):
+            if not hasattr(folder, 'title') or not folder.title:
                 continue
+                
+            # Получаем чаты в папке
+            chats_in_folder = []
+            for peer in folder.include_peers:
+                try:
+                    # Получаем сущность чата
+                    chat = await client.get_entity(peer)
+                    chats_in_folder.append({
+                        'id': chat.id,
+                        'title': getattr(chat, 'title', None) or f"{getattr(chat, 'first_name', '')} {getattr(chat, 'last_name', '')}".strip(),
+                        'username': getattr(chat, 'username', None),
+                        'entity': chat
+                    })
+                except Exception as e:
+                    continue
+            
+            folders.append({
+                'index': i,
+                'title': folder.title,
+                'chats': chats_in_folder,
+                'count': len(chats_in_folder)
+            })
         
-        return folder_chats, None
+        return folders, None
     except Exception as e:
         return None, str(e)
 
 # ========== КОМАНДЫ БОТА ==========
 
-@app.on_message(filters.command("start"))
-async def start_command(client: Client, message: Message):
-    """Приветствие"""
-    await message.reply_text(
-        "🔥 **Spam Bot v3.0**\n\n"
+@bot.on(events.NewMessage(pattern='/start'))
+async def start_handler(event):
+    await event.reply(
+        "🔥 **Spam Bot v4.0**\n\n"
         "Команды:\n"
-        "/add_account - добавить аккаунт для рассылки\n"
+        "/add_account - добавить аккаунт\n"
         "/my_accounts - список аккаунтов\n"
-        "/add_links - добавить ссылки для спама\n"
-        "/add_folder - спам по папке Telegram\n"
         "/select_account - выбрать аккаунт\n"
-        "/spam_start - запустить рассылку\n"
+        "/list_folders - показать папки на аккаунте\n"
+        "/select_folder - выбрать папку для спама\n"
+        "/set_spam - настроить рассылку\n"
+        "/spam_start - запустить\n"
         "/spam_stop - остановить\n"
         "/status - прогресс\n\n"
-        "⚡ Работает 24/7 на Railway"
+        "⚡ Работает 24/7"
     )
 
-@app.on_message(filters.command("add_account"))
-async def add_account(client: Client, message: Message):
-    """Добавление аккаунта через userbot"""
-    user_id = message.from_user.id
+@bot.on(events.NewMessage(pattern='/add_account'))
+async def add_account_handler(event):
+    user_id = event.sender_id
+    await get_or_create_user(user_id)
     
-    # Создаем пользователя в БД
-    async with await init_db() as session:
-        await get_or_create_user(session, user_id)
-    
-    # Запрашиваем номер телефона
-    await message.reply_text(
-        "📱 Отправь номер телефона аккаунта (в формате +71234567890):"
-    )
-    
-    # Сохраняем состояние
+    await event.reply("📱 Отправь номер телефона (в формате +71234567890):")
     user_sessions[user_id] = {"state": "waiting_phone"}
 
-@app.on_message(filters.command("my_accounts"))
-async def my_accounts(client: Client, message: Message):
-    """Список аккаунтов пользователя"""
-    user_id = message.from_user.id
+@bot.on(events.NewMessage(pattern='/my_accounts'))
+async def my_accounts_handler(event):
+    user_id = event.sender_id
     accounts = await get_user_accounts(user_id)
     
     if not accounts:
-        await message.reply_text("❌ У тебя нет добавленных аккаунтов")
+        await event.reply("❌ Нет аккаунтов")
         return
     
-    text = "📋 **Твои аккаунты:**\n\n"
-    for i, acc in enumerate(accounts, 1):
-        status = "✅ активен" if acc.is_active else "❌ неактивен"
-        text += f"{i}. {acc.phone} - {status}\n"
+    text = "📋 **Аккаунты:**\n"
+    for acc in accounts:
+        status = "✅" if acc.is_active else "❌"
+        text += f"\n{status} {acc.phone}"
     
-    await message.reply_text(text)
+    await event.reply(text)
 
-@app.on_message(filters.command("add_links"))
-async def add_links(client: Client, message: Message):
-    """Добавление ссылок для спама"""
-    user_id = message.from_user.id
-    
-    # Проверяем есть ли аккаунты
+@bot.on(events.NewMessage(pattern='/select_account'))
+async def select_account_handler(event):
+    user_id = event.sender_id
     accounts = await get_user_accounts(user_id)
+    
     if not accounts:
-        await message.reply_text("❌ Сначала добавь аккаунт через /add_account")
+        await event.reply("❌ Сначала добавь аккаунт")
         return
     
-    # Запрашиваем ссылки
-    await message.reply_text(
-        "🔗 Отправь список ссылок на чаты/каналы (каждая с новой строки):\n\n"
-        "Пример:\n"
-        "https://t.me/chat1\n"
-        "https://t.me/+InviteLink\n"
-        "@username\n\n"
-        "И сообщение для рассылки через пустую строку:"
-    )
+    buttons = []
+    for acc in accounts:
+        buttons.append([Button.inline(f"{acc.phone}", data=f"select_acc_{acc.id}")])
     
-    user_sessions[user_id] = {"state": "waiting_links"}
+    await event.reply("🔢 **Выбери аккаунт:**", buttons=buttons)
 
-@app.on_message(filters.command("add_folder"))
-async def add_folder(client: Client, message: Message):
-    """Добавить папку для спама"""
-    user_id = message.from_user.id
+@bot.on(events.NewMessage(pattern='/list_folders'))
+async def list_folders_handler(event):
+    user_id = event.sender_id
     
-    # Проверяем есть ли аккаунты
-    accounts = await get_user_accounts(user_id)
-    if not accounts:
-        await message.reply_text("❌ Сначала добавь аккаунт через /add_account")
-        return
-    
-    # Получаем выбранный аккаунт из сессии или берем первый
+    # Получаем выбранный аккаунт
     account_id = user_sessions.get(user_id, {}).get("account_id")
     if not account_id:
-        account_id = accounts[0].id
-        await message.reply_text(f"⚠️ Аккаунт не выбран, использую {accounts[0].phone}")
-    
-    # Запрашиваем название папки
-    await message.reply_text(
-        "📁 Отправь **название папки** из Telegram (как оно отображается):\n\n"
-        "Например: `Работа`, `Друзья`, `Каналы`\n\n"
-        "И сообщение для рассылки через пустую строку:"
-    )
-    
-    user_sessions[user_id] = {
-        "state": "waiting_folder",
-        "account_id": account_id
-    }
-
-@app.on_message(filters.command("select_account"))
-async def select_account(client: Client, message: Message):
-    """Выбор аккаунта для рассылки"""
-    user_id = message.from_user.id
-    accounts = await get_user_accounts(user_id)
-    
-    if not accounts:
-        await message.reply_text("❌ Сначала добавь аккаунт")
+        await event.reply("❌ Сначала выбери аккаунт через /select_account")
         return
     
-    text = "🔢 **Выбери номер аккаунта:**\n\n"
-    for i, acc in enumerate(accounts, 1):
-        text += f"{i}. {acc.phone}\n"
-    text += "\nОтправь /select_account [номер]"
+    account = await get_account_by_id(account_id)
+    if not account:
+        await event.reply("❌ Аккаунт не найден")
+        return
     
-    # Парсим номер из команды
-    parts = message.text.split()
-    if len(parts) > 1 and parts[1].isdigit():
-        index = int(parts[1]) - 1
-        if 0 <= index < len(accounts):
-            selected = accounts[index]
-            
-            # Сохраняем выбранный аккаунт в сессии
-            user_sessions[user_id] = {
-                "state": "account_selected",
-                "account_id": selected.id
-            }
-            
-            await message.reply_text(f"✅ Выбран аккаунт {selected.phone}")
+    await event.reply("⏳ Получаю папки...")
+    
+    try:
+        # Создаем клиент для аккаунта
+        client = TelegramClient(StringSession(account.session_string), API_ID, API_HASH)
+        await client.start()
+        
+        # Получаем папки
+        folders, error = await get_folders_with_chats(client)
+        
+        if error:
+            await event.reply(f"❌ Ошибка: {error}")
+            await client.disconnect()
             return
-    
-    await message.reply_text(text)
+        
+        if not folders:
+            await event.reply("❌ Папки не найдены")
+            await client.disconnect()
+            return
+        
+        # Сохраняем в кэш
+        user_folders_cache[user_id] = folders
+        
+        # Показываем папки
+        text = "📁 **Найденные папки:**\n\n"
+        for i, folder in enumerate(folders[:10]):  # Показываем первые 10
+            preview = ", ".join([c['title'][:20] for c in folder['chats'][:3]])
+            text += f"{i+1}. **{folder['title']}** - {folder['count']} чатов\n"
+            if preview:
+                text += f"   *{preview}...*\n\n"
+        
+        text += "\nИспользуй /select_folder [номер] для выбора"
+        await event.reply(text)
+        
+        await client.disconnect()
+        
+    except Exception as e:
+        await event.reply(f"❌ Ошибка: {str(e)}")
 
-@app.on_message(filters.command("spam_start"))
-async def spam_start(client: Client, message: Message):
-    """Запуск рассылки"""
-    user_id = message.from_user.id
+@bot.on(events.NewMessage(pattern='/select_folder'))
+async def select_folder_handler(event):
+    user_id = event.sender_id
+    
+    if user_id not in user_folders_cache:
+        await event.reply("❌ Сначала выполни /list_folders")
+        return
+    
+    parts = event.message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await event.reply("❌ Укажи номер папки: /select_folder 1")
+        return
+    
+    folder_index = int(parts[1]) - 1
+    folders = user_folders_cache[user_id]
+    
+    if folder_index < 0 or folder_index >= len(folders):
+        await event.reply("❌ Неправильный номер")
+        return
+    
+    selected_folder = folders[folder_index]
+    
+    # Сохраняем выбранную папку
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {}
+    
+    user_sessions[user_id]['folder'] = {
+        'title': selected_folder['title'],
+        'chats': selected_folder['chats']
+    }
+    
+    await event.reply(
+        f"✅ Выбрана папка **{selected_folder['title']}**\n"
+        f"Чатов в папке: {selected_folder['count']}\n\n"
+        f"Теперь используй /set_spam для настройки рассылки"
+    )
+
+@bot.on(events.NewMessage(pattern='/set_spam'))
+async def set_spam_handler(event):
+    user_id = event.sender_id
+    
+    if user_id not in user_sessions or 'folder' not in user_sessions[user_id]:
+        await event.reply("❌ Сначала выбери папку через /select_folder")
+        return
+    
+    # Запрашиваем сообщение и задержку
+    user_sessions[user_id]['state'] = 'waiting_spam_settings'
+    await event.reply(
+        "📝 Отправь настройки рассылки в формате:\n\n"
+        "**Сообщение**\n\n"
+        "Задержка (сек)\n\n"
+        "Пример:\n"
+        "Привет! Это сообщение для всех чатов\n\n"
+        "5-15"
+    )
+
+@bot.on(events.NewMessage(pattern='/spam_start'))
+async def spam_start_handler(event):
+    user_id = event.sender_id
     
     # Проверяем есть ли задача
     async with await init_db() as session:
@@ -264,51 +279,30 @@ async def spam_start(client: Client, message: Message):
         task = result.scalar_one_or_none()
     
     if not task:
-        await message.reply_text("❌ Нет активной задачи. Сначала добавь ссылки или папку")
+        await event.reply("❌ Нет активной задачи. Сначала настрой через /set_spam")
         return
     
     if user_id in active_tasks and active_tasks[user_id]:
-        await message.reply_text("⚠️ Рассылка уже запущена")
+        await event.reply("⚠️ Рассылка уже запущена")
         return
     
-    # Запускаем рассылку
-    await message.reply_text("🚀 Запускаю рассылку...")
-    
-    # Создаем задачу
-    active_tasks[user_id] = asyncio.create_task(
-        run_spam_task(user_id, task.id)
-    )
+    await event.reply("🚀 Запускаю рассылку...")
+    active_tasks[user_id] = asyncio.create_task(run_spam_task(user_id, task.id))
 
-@app.on_message(filters.command("spam_stop"))
-async def spam_stop(client: Client, message: Message):
-    """Остановка рассылки"""
-    user_id = message.from_user.id
+@bot.on(events.NewMessage(pattern='/spam_stop'))
+async def spam_stop_handler(event):
+    user_id = event.sender_id
     
     if user_id in active_tasks and active_tasks[user_id]:
         active_tasks[user_id].cancel()
         del active_tasks[user_id]
-        
-        # Обновляем статус в БД
-        async with await init_db() as session:
-            result = await session.execute(
-                select(SpamTask).where(
-                    SpamTask.user_id == user_id,
-                    SpamTask.is_running == True
-                )
-            )
-            task = result.scalar_one_or_none()
-            if task:
-                task.is_running = False
-                await session.commit()
-        
-        await message.reply_text("⏹ Рассылка остановлена")
+        await event.reply("⏹ Рассылка остановлена")
     else:
-        await message.reply_text("❌ Нет активной рассылки")
+        await event.reply("❌ Нет активной рассылки")
 
-@app.on_message(filters.command("status"))
-async def status_command(client: Client, message: Message):
-    """Статус рассылки"""
-    user_id = message.from_user.id
+@bot.on(events.NewMessage(pattern='/status'))
+async def status_handler(event):
+    user_id = event.sender_id
     
     async with await init_db() as session:
         result = await session.execute(
@@ -321,429 +315,251 @@ async def status_command(client: Client, message: Message):
     
     if task:
         links = json.loads(task.links)
-        await message.reply_text(
-            f"📊 **Статус рассылки:**\n\n"
+        await event.reply(
+            f"📊 **Статус:**\n"
             f"Отправлено: {task.total_sent}/{len(links)}\n"
-            f"Аккаунт ID: {task.account_id}\n"
             f"Задержка: {task.delay_min}-{task.delay_max} сек"
         )
     else:
-        await message.reply_text("❌ Нет активной рассылки")
+        await event.reply("❌ Нет активной рассылки")
 
 # ========== ОБРАБОТКА СООБЩЕНИЙ ==========
 
-@app.on_message(filters.private & ~filters.command(["start", "add_account", "my_accounts", "add_links", "add_folder", "select_account", "spam_start", "spam_stop", "status"]))
-async def handle_messages(client: Client, message: Message):
-    """Обработка входящих сообщений"""
-    user_id = message.from_user.id
+@bot.on(events.NewMessage)
+async def handle_messages(event):
+    user_id = event.sender_id
     
-    # Проверяем состояние пользователя
     if user_id not in user_sessions:
         return
     
     state = user_sessions[user_id].get("state")
     
-    # === ЭТАП 1: ВВОД НОМЕРА ТЕЛЕФОНА ===
+    # === ДОБАВЛЕНИЕ АККАУНТА ===
     if state == "waiting_phone":
-        phone = message.text.strip()
+        phone = event.message.text.strip()
         
-        # Создаем клиент для userbot
-        user_client = Client(
-            f"user_{user_id}_{phone}",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            in_memory=True
-        )
+        client = TelegramClient(f'session_{user_id}', API_ID, API_HASH)
+        await client.connect()
         
         try:
-            # Отправляем код подтверждения
-            await message.reply_text("⏳ Отправляю код подтверждения...")
+            await event.reply("⏳ Отправляю код...")
+            sent = await client.send_code_request(phone)
             
-            await user_client.connect()
-            sent_code = await user_client.send_code(phone)
-            
-            # Сохраняем данные
             user_sessions[user_id].update({
                 "state": "waiting_code",
                 "phone": phone,
-                "user_client": user_client,
-                "phone_code_hash": sent_code.phone_code_hash
+                "client": client,
+                "phone_code_hash": sent.phone_code_hash
             })
             
-            await message.reply_text("🔐 Введи код из Telegram (цифры):")
+            await event.reply("🔐 Введи код из Telegram:")
             
         except Exception as e:
-            await message.reply_text(f"❌ Ошибка: {str(e)}")
+            await event.reply(f"❌ Ошибка: {str(e)}")
             del user_sessions[user_id]
     
-    # === ЭТАП 2: ВВОД КОДА ПОДТВЕРЖДЕНИЯ ===
     elif state == "waiting_code":
-        code = message.text.strip().replace(" ", "")
+        code = event.message.text.strip()
         
-        user_client = user_sessions[user_id]["user_client"]
+        client = user_sessions[user_id]["client"]
         phone = user_sessions[user_id]["phone"]
         phone_code_hash = user_sessions[user_id]["phone_code_hash"]
         
         try:
-            # Пытаемся войти
-            await user_client.sign_in(
-                phone_number=phone,
-                phone_code_hash=phone_code_hash,
-                phone_code=code
-            )
+            await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
             
-            # Если успешно - сохраняем сессию
-            session_string = await user_client.export_session_string()
+            session_string = client.session.save()
             await save_session(user_id, phone, session_string)
             
-            await message.reply_text("✅ Аккаунт успешно добавлен!")
-            
-            await user_client.disconnect()
+            await event.reply("✅ Аккаунт добавлен!")
+            await client.disconnect()
             del user_sessions[user_id]
             
-        except SessionPasswordNeeded:
-            # Требуется двухфакторка
+        except SessionPasswordNeededError:
             user_sessions[user_id]["state"] = "waiting_2fa"
-            await message.reply_text("🔐 На аккаунте включена двухфакторка. Введи пароль:")
+            await event.reply("🔐 Введи пароль 2FA:")
             
         except Exception as e:
-            await message.reply_text(f"❌ Ошибка: {str(e)}")
+            await event.reply(f"❌ Ошибка: {str(e)}")
             del user_sessions[user_id]
     
-    # === ЭТАП 3: ДВУХФАКТОРКА ===
     elif state == "waiting_2fa":
-        password = message.text.strip()
+        password = event.message.text.strip()
         
-        user_client = user_sessions[user_id]["user_client"]
+        client = user_sessions[user_id]["client"]
         phone = user_sessions[user_id]["phone"]
-        phone_code_hash = user_sessions[user_id]["phone_code_hash"]
         
         try:
-            # Вход с паролем
-            await user_client.sign_in(
-                phone_number=phone,
-                phone_code_hash=phone_code_hash,
-                password=password
-            )
+            await client.sign_in(password=password)
             
-            session_string = await user_client.export_session_string()
+            session_string = client.session.save()
             await save_session(user_id, phone, session_string)
             
-            await message.reply_text("✅ Аккаунт успешно добавлен!")
-            
-            await user_client.disconnect()
+            await event.reply("✅ Аккаунт добавлен!")
+            await client.disconnect()
             del user_sessions[user_id]
             
         except Exception as e:
-            await message.reply_text(f"❌ Неправильный пароль: {str(e)}")
-            # Оставляем в состоянии waiting_2fa для повторной попытки
+            await event.reply(f"❌ Неправильный пароль: {str(e)}")
     
-    # === ЭТАП 4: ДОБАВЛЕНИЕ ССЫЛОК ===
-    elif state == "waiting_links":
-        text = message.text.strip()
-        
-        # Разделяем ссылки и сообщение
+    # === НАСТРОЙКА СПАМА ===
+    elif state == "waiting_spam_settings":
+        text = event.message.text.strip()
         parts = text.split("\n\n")
+        
         if len(parts) < 2:
-            await message.reply_text("❌ Неправильный формат. Нужно: ссылки (по одной на строке), пустая строка, сообщение")
+            await event.reply("❌ Нужно: сообщение, пустая строка, задержка")
             return
         
-        links_text = parts[0].strip()
-        spam_message = "\n\n".join(parts[1:]).strip()
+        message_text = parts[0].strip()
+        delay_part = parts[1].strip()
         
-        # Парсим ссылки
-        links = []
-        for line in links_text.split("\n"):
-            line = line.strip()
-            if line:
-                links.append(line)
+        # Парсим задержку
+        if "-" in delay_part:
+            min_delay, max_delay = map(int, delay_part.split("-"))
+        else:
+            min_delay = max_delay = int(delay_part)
         
-        if not links or not spam_message:
-            await message.reply_text("❌ Ссылки или сообщение пустые")
-            return
-        
-        # Получаем выбранный аккаунт
+        # Получаем чаты из выбранной папки
+        folder = user_sessions[user_id]['folder']
         account_id = user_sessions[user_id].get("account_id")
-        if not account_id:
-            # Берем первый аккаунт
-            accounts = await get_user_accounts(user_id)
-            if not accounts:
-                await message.reply_text("❌ Нет аккаунтов")
-                return
-            account_id = accounts[0].id
         
-        # Сохраняем задачу в БД
+        # Формируем ссылки
+        links = []
+        for chat in folder['chats']:
+            if chat['username']:
+                links.append(f"@{chat['username']}")
+            else:
+                links.append(f"private:{chat['id']}")
+        
+        # Сохраняем задачу
         async with await init_db() as session:
             task = SpamTask(
                 user_id=user_id,
                 account_id=account_id,
                 links=json.dumps(links),
-                message=spam_message,
-                delay_min=MIN_DELAY,
-                delay_max=MAX_DELAY,
+                message=message_text,
+                delay_min=min_delay,
+                delay_max=max_delay,
                 is_running=False
             )
             session.add(task)
             await session.commit()
-            
-            await message.reply_text(
-                f"✅ Задача создана!\n\n"
-                f"Ссылок: {len(links)}\n"
-                f"Аккаунт ID: {account_id}\n\n"
-                f"Для запуска используй /spam_start"
-            )
         
-        del user_sessions[user_id]
-    
-    # === ЭТАП 5: ДОБАВЛЕНИЕ ПАПКИ ===
-    elif state == "waiting_folder":
-        text = message.text.strip()
+        await event.reply(
+            f"✅ **Задача создана!**\n\n"
+            f"Папка: {folder['title']}\n"
+            f"Чатов: {len(links)}\n"
+            f"Задержка: {min_delay}-{max_delay} сек\n\n"
+            f"Запусти: /spam_start"
+        )
         
-        # Разделяем название папки и сообщение
-        parts = text.split("\n\n")
-        if len(parts) < 2:
-            await message.reply_text("❌ Неправильный формат. Нужно: название папки, пустая строка, сообщение")
-            return
-        
-        folder_name = parts[0].strip()
-        spam_message = "\n\n".join(parts[1:]).strip()
-        
-        if not folder_name or not spam_message:
-            await message.reply_text("❌ Название папки или сообщение пустые")
-            return
-        
-        account_id = user_sessions[user_id].get("account_id")
-        
-        # Получаем аккаунт из БД
-        async with await init_db() as session:
-            result = await session.execute(
-                select(Account).where(Account.id == account_id)
-            )
-            account = result.scalar_one_or_none()
-        
-        if not account:
-            await message.reply_text("❌ Аккаунт не найден")
-            del user_sessions[user_id]
-            return
-        
-        # Подключаемся к аккаунту
-        try:
-            await message.reply_text(f"⏳ Получаю чаты из папки '{folder_name}'...")
-            
-            user_client = Client(
-                f"folder_{account_id}",
-                api_id=API_ID,
-                api_hash=API_HASH,
-                session_string=account.session_string
-            )
-            
-            await user_client.start()
-            
-            # Получаем чаты из папки
-            folder_chats, error = await get_chats_from_folder(user_client, folder_name)
-            
-            if error:
-                await message.reply_text(f"❌ {error}")
-                await user_client.stop()
-                del user_sessions[user_id]
-                return
-            
-            if not folder_chats:
-                await message.reply_text(f"❌ В папке '{folder_name}' нет чатов")
-                await user_client.stop()
-                del user_sessions[user_id]
-                return
-            
-            # Формируем ссылки для рассылки
-            links = []
-            for chat in folder_chats:
-                if chat['username']:
-                    links.append(f"@{chat['username']}")
-                else:
-                    # Для приватных чатов используем ID
-                    links.append(f"private:{chat['id']}")
-            
-            # Сохраняем задачу в БД
-            async with await init_db() as session:
-                task = SpamTask(
-                    user_id=user_id,
-                    account_id=account_id,
-                    links=json.dumps(links),
-                    message=spam_message,
-                    delay_min=MIN_DELAY,
-                    delay_max=MAX_DELAY,
-                    is_running=False
-                )
-                session.add(task)
-                await session.commit()
-                
-                # Показываем список найденных чатов
-                chats_list = "\n".join([f"• {chat['title']}" for chat in folder_chats[:10]])
-                if len(folder_chats) > 10:
-                    chats_list += f"\n• ... и еще {len(folder_chats) - 10} чатов"
-                
-                await message.reply_text(
-                    f"✅ Задача создана из папки '{folder_name}'!\n\n"
-                    f"Найдено чатов: {len(folder_chats)}\n"
-                    f"Первые 10:\n{chats_list}\n\n"
-                    f"Аккаунт ID: {account_id}\n\n"
-                    f"Для запуска используй /spam_start"
-                )
-            
-            await user_client.stop()
-            del user_sessions[user_id]
-            
-        except Exception as e:
-            await message.reply_text(f"❌ Ошибка при получении папки: {str(e)}")
-            del user_sessions[user_id]
+        del user_sessions[user_id]['state']
 
-# ========== ОСНОВНАЯ ЛОГИКА РАССЫЛКИ ==========
+# ========== ОБРАБОТКА INLINE КНОПОК ==========
+
+@bot.on(events.CallbackQuery)
+async def callback_handler(event):
+    user_id = event.sender_id
+    data = event.data.decode()
+    
+    if data.startswith("select_acc_"):
+        account_id = int(data.replace("select_acc_", ""))
+        
+        if user_id not in user_sessions:
+            user_sessions[user_id] = {}
+        
+        user_sessions[user_id]['account_id'] = account_id
+        
+        await event.edit(f"✅ Аккаунт выбран!")
+        await event.respond("Теперь используй /list_folders для просмотра папок")
+
+# ========== ЗАПУСК РАССЫЛКИ ==========
 
 async def run_spam_task(user_id: int, task_id: int):
-    """Запуск рассылки в фоне"""
     try:
-        # Получаем задачу из БД
         async with await init_db() as session:
-            result = await session.execute(
-                select(SpamTask).where(SpamTask.id == task_id)
-            )
+            result = await session.execute(select(SpamTask).where(SpamTask.id == task_id))
             task = result.scalar_one_or_none()
             
-            if not task:
-                return
-            
-            # Получаем аккаунт
-            acc_result = await session.execute(
-                select(Account).where(Account.id == task.account_id)
-            )
+            acc_result = await session.execute(select(Account).where(Account.id == task.account_id))
             account = acc_result.scalar_one_or_none()
             
-            if not account:
-                return
-            
-            # Помечаем как запущенную
             task.is_running = True
             await session.commit()
         
-        # Создаем клиент для рассылки
-        user_client = Client(
-            f"spammer_{account.id}",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            session_string=account.session_string
-        )
+        # Подключаемся к аккаунту
+        client = TelegramClient(StringSession(account.session_string), API_ID, API_HASH)
+        await client.start()
         
-        await user_client.start()
-        
-        # Получаем список ссылок
         links = json.loads(task.links)
         total = len(links)
         sent = task.total_sent
         
-        # Отправляем уведомление
-        await app.send_message(
-            user_id,
-            f"▶️ Начинаю рассылку. Всего целей: {total}"
-        )
+        await bot.send_message(user_id, f"▶️ Начинаю рассылку. Всего: {total}")
         
-        # Рассылаем по очереди
         for i, link in enumerate(links[sent:], start=sent+1):
-            # Проверяем не остановлена ли задача
             if user_id not in active_tasks:
                 break
             
             try:
-                # Для приватных чатов по ID
+                # Получаем чат
                 if link.startswith("private:"):
                     chat_id = int(link.replace("private:", ""))
-                    try:
-                        chat = await user_client.get_chat(chat_id)
-                    except:
-                        await app.send_message(user_id, f"❌ Не удалось получить чат {chat_id}")
-                        continue
+                    chat = await client.get_entity(chat_id)
                 else:
-                    # Пытаемся присоединиться к чату по ссылке/юзернейму
-                    try:
-                        chat = await user_client.join_chat(link)
-                    except UserAlreadyParticipant:
-                        # Уже в чате, получаем информацию
-                        if link.startswith("https://t.me/+"):
-                            chat = await user_client.get_chat(link)
-                        else:
-                            username = link.replace("https://t.me/", "").replace("@", "")
-                            chat = await user_client.get_chat(username)
-                    except InviteHashExpired:
-                        await app.send_message(user_id, f"❌ Ссылка {link} истекла")
-                        continue
-                    except Exception as e:
-                        await app.send_message(user_id, f"❌ Не удалось войти в {link}: {str(e)}")
-                        continue
+                    chat = await client.get_entity(link)
                 
-                # Отправляем сообщение
-                await user_client.send_message(chat.id, task.message)
+                # Отправляем
+                await client.send_message(chat, task.message)
                 
-                # Обновляем счетчик
                 sent += 1
                 async with await init_db() as session:
                     await session.execute(
-                        SpamTask.__table__.update().
-                        where(SpamTask.id == task_id).
-                        values(total_sent=sent)
+                        SpamTask.__table__.update()
+                        .where(SpamTask.id == task_id)
+                        .values(total_sent=sent)
                     )
                     await session.commit()
                 
-                await app.send_message(
+                await bot.send_message(
                     user_id,
-                    f"✅ [{i}/{total}] Отправлено в {chat.title}"
+                    f"✅ [{i}/{total}] Отправлено в {getattr(chat, 'title', chat.first_name)}"
                 )
                 
-                # Задержка
                 delay = random.randint(task.delay_min, task.delay_max)
                 await asyncio.sleep(delay)
                 
-            except FloodWait as e:
-                wait = e.value
-                await app.send_message(
-                    user_id,
-                    f"⚠️ Flood wait {wait} секунд. Ждем..."
-                )
-                await asyncio.sleep(wait)
+            except FloodWaitError as e:
+                await bot.send_message(user_id, f"⚠️ Flood wait {e.seconds} сек")
+                await asyncio.sleep(e.seconds)
             except Exception as e:
-                await app.send_message(
-                    user_id,
-                    f"❌ Ошибка при отправке в {link}: {str(e)}"
-                )
+                await bot.send_message(user_id, f"❌ Ошибка: {str(e)}")
                 continue
         
-        # Завершаем
-        await user_client.stop()
+        await client.disconnect()
         
         async with await init_db() as session:
             await session.execute(
-                SpamTask.__table__.update().
-                where(SpamTask.id == task_id).
-                values(is_running=False)
+                SpamTask.__table__.update()
+                .where(SpamTask.id == task_id)
+                .values(is_running=False)
             )
             await session.commit()
         
-        await app.send_message(
-            user_id,
-            f"🏁 Рассылка завершена! Отправлено: {sent}/{total}"
-        )
+        await bot.send_message(user_id, f"🏁 Рассылка завершена! Отправлено: {sent}/{total}")
         
     except asyncio.CancelledError:
-        # Задача отменена пользователем
         async with await init_db() as session:
             await session.execute(
-                SpamTask.__table__.update().
-                where(SpamTask.id == task_id).
-                values(is_running=False)
+                SpamTask.__table__.update()
+                .where(SpamTask.id == task_id)
+                .values(is_running=False)
             )
             await session.commit()
-        
-        await app.send_message(user_id, "⏹ Рассылка остановлена")
+        await bot.send_message(user_id, "⏹ Рассылка остановлена")
     except Exception as e:
-        await app.send_message(user_id, f"💥 Критическая ошибка: {str(e)}")
+        await bot.send_message(user_id, f"💥 Ошибка: {str(e)}")
     finally:
         if user_id in active_tasks:
             del active_tasks[user_id]
@@ -751,5 +567,5 @@ async def run_spam_task(user_id: int, task_id: int):
 # ========== ЗАПУСК ==========
 
 if __name__ == "__main__":
-    print("🔥 Spam Bot запущен...")
-    app.run()
+    print("🔥 Spam Bot v4.0 запущен...")
+    bot.run_until_disconnected()
