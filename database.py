@@ -3,6 +3,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, JSON
 from datetime import datetime
 import json
+from config import DATABASE_URL
 
 Base = declarative_base()
 
