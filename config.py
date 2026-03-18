@@ -1,5 +1,7 @@
 import os
 
+__all__ = ['API_ID', 'API_HASH', 'BOT_TOKEN', 'DATABASE_URL', 'MIN_DELAY', 'MAX_DELAY']
+
 # Конфигурация бота
 API_ID = int(os.environ.get("API_ID", 32510266))
 API_HASH = os.environ.get("API_HASH", "b65af61f1c3e54d29b5b555fd996e5cb")
