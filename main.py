@@ -6,7 +6,8 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import (
     PeerIdInvalid, UsernameInvalid, ChatAdminRequired,
-    UserAlreadyParticipant, InviteHashExpired, FloodWait
+    UserAlreadyParticipant, InviteHashExpired, FloodWait,
+    SessionPasswordNeeded
 )
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -90,7 +91,7 @@ async def add_account(client: Client, message: Message):
         await get_or_create_user(session, user_id)
     
     # Запрашиваем номер телефона
-    msg = await message.reply_text(
+    await message.reply_text(
         "📱 Отправь номер телефона аккаунта (в формате +71234567890):"
     )
     
@@ -314,10 +315,8 @@ async def handle_messages(client: Client, message: Message):
                 phone_code=code
             )
             
-            # Получаем строку сессии
+            # Если успешно - сохраняем сессию
             session_string = await user_client.export_session_string()
-            
-            # Сохраняем в БД
             await save_session(user_id, phone, session_string)
             
             await message.reply_text("✅ Аккаунт успешно добавлен!")
@@ -325,14 +324,14 @@ async def handle_messages(client: Client, message: Message):
             await user_client.disconnect()
             del user_sessions[user_id]
             
+        except SessionPasswordNeeded:
+            # Требуется двухфакторка
+            user_sessions[user_id]["state"] = "waiting_2fa"
+            await message.reply_text("🔐 На аккаунте включена двухфакторка. Введи пароль:")
+            
         except Exception as e:
-            # Возможно нужна двухфакторка
-            if "PASSWORD_HASH_INVALID" in str(e) or "TwoFactor" in str(e):
-                user_sessions[user_id]["state"] = "waiting_2fa"
-                await message.reply_text("🔐 Введи пароль двухфакторной аутентификации:")
-            else:
-                await message.reply_text(f"❌ Ошибка: {str(e)}")
-                del user_sessions[user_id]
+            await message.reply_text(f"❌ Ошибка: {str(e)}")
+            del user_sessions[user_id]
     
     # === ЭТАП 3: ДВУХФАКТОРКА ===
     elif state == "waiting_2fa":
@@ -340,9 +339,15 @@ async def handle_messages(client: Client, message: Message):
         
         user_client = user_sessions[user_id]["user_client"]
         phone = user_sessions[user_id]["phone"]
+        phone_code_hash = user_sessions[user_id]["phone_code_hash"]
         
         try:
-            await user_client.check_password(password)
+            # Вход с паролем
+            await user_client.sign_in(
+                phone_number=phone,
+                phone_code_hash=phone_code_hash,
+                password=password
+            )
             
             session_string = await user_client.export_session_string()
             await save_session(user_id, phone, session_string)
@@ -353,8 +358,8 @@ async def handle_messages(client: Client, message: Message):
             del user_sessions[user_id]
             
         except Exception as e:
-            await message.reply_text(f"❌ Ошибка: {str(e)}")
-            del user_sessions[user_id]
+            await message.reply_text(f"❌ Неправильный пароль: {str(e)}")
+            # Оставляем в состоянии waiting_2fa для повторной попытки
     
     # === ЭТАП 4: ДОБАВЛЕНИЕ ССЫЛОК ===
     elif state == "waiting_links":
