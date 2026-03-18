@@ -63,17 +63,65 @@ async def get_user_accounts(user_id: int):
         )
         return result.scalars().all()
 
+async def get_chats_from_folder(user_client: Client, folder_name: str):
+    """Получить все чаты из указанной папки"""
+    try:
+        # Получаем все диалоги
+        dialogs = []
+        async for dialog in user_client.get_dialogs():
+            dialogs.append(dialog)
+        
+        # Получаем информацию о папках
+        folders = await user_client.get_folders()
+        
+        # Ищем нужную папку
+        target_folder = None
+        for folder in folders:
+            if folder.title.lower() == folder_name.lower():
+                target_folder = folder
+                break
+        
+        if not target_folder:
+            return None, f"Папка '{folder_name}' не найдена"
+        
+        # Собираем чаты из папки
+        folder_chats = []
+        for peer in target_folder.included_peers:
+            try:
+                # Получаем информацию о чате
+                if hasattr(peer, 'channel_id'):
+                    chat = await user_client.get_chat(peer.channel_id)
+                elif hasattr(peer, 'chat_id'):
+                    chat = await user_client.get_chat(peer.chat_id)
+                elif hasattr(peer, 'user_id'):
+                    chat = await user_client.get_chat(peer.user_id)
+                else:
+                    continue
+                
+                folder_chats.append({
+                    'id': chat.id,
+                    'title': chat.title or f"{chat.first_name} {chat.last_name or ''}",
+                    'username': chat.username
+                })
+            except Exception as e:
+                continue
+        
+        return folder_chats, None
+    except Exception as e:
+        return None, str(e)
+
 # ========== КОМАНДЫ БОТА ==========
 
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     """Приветствие"""
     await message.reply_text(
-        "🔥 **Spam Bot v2.0**\n\n"
+        "🔥 **Spam Bot v3.0**\n\n"
         "Команды:\n"
         "/add_account - добавить аккаунт для рассылки\n"
         "/my_accounts - список аккаунтов\n"
         "/add_links - добавить ссылки для спама\n"
+        "/add_folder - спам по папке Telegram\n"
         "/select_account - выбрать аккаунт\n"
         "/spam_start - запустить рассылку\n"
         "/spam_stop - остановить\n"
@@ -138,6 +186,35 @@ async def add_links(client: Client, message: Message):
     
     user_sessions[user_id] = {"state": "waiting_links"}
 
+@app.on_message(filters.command("add_folder"))
+async def add_folder(client: Client, message: Message):
+    """Добавить папку для спама"""
+    user_id = message.from_user.id
+    
+    # Проверяем есть ли аккаунты
+    accounts = await get_user_accounts(user_id)
+    if not accounts:
+        await message.reply_text("❌ Сначала добавь аккаунт через /add_account")
+        return
+    
+    # Получаем выбранный аккаунт из сессии или берем первый
+    account_id = user_sessions.get(user_id, {}).get("account_id")
+    if not account_id:
+        account_id = accounts[0].id
+        await message.reply_text(f"⚠️ Аккаунт не выбран, использую {accounts[0].phone}")
+    
+    # Запрашиваем название папки
+    await message.reply_text(
+        "📁 Отправь **название папки** из Telegram (как оно отображается):\n\n"
+        "Например: `Работа`, `Друзья`, `Каналы`\n\n"
+        "И сообщение для рассылки через пустую строку:"
+    )
+    
+    user_sessions[user_id] = {
+        "state": "waiting_folder",
+        "account_id": account_id
+    }
+
 @app.on_message(filters.command("select_account"))
 async def select_account(client: Client, message: Message):
     """Выбор аккаунта для рассылки"""
@@ -187,7 +264,7 @@ async def spam_start(client: Client, message: Message):
         task = result.scalar_one_or_none()
     
     if not task:
-        await message.reply_text("❌ Нет активной задачи. Сначала добавь ссылки через /add_links")
+        await message.reply_text("❌ Нет активной задачи. Сначала добавь ссылки или папку")
         return
     
     if user_id in active_tasks and active_tasks[user_id]:
@@ -253,11 +330,11 @@ async def status_command(client: Client, message: Message):
     else:
         await message.reply_text("❌ Нет активной рассылки")
 
-# ========== ОБРАБОТКА СООБЩЕНИЙ (ДЛЯ ДОБАВЛЕНИЯ АККАУНТОВ) ==========
+# ========== ОБРАБОТКА СООБЩЕНИЙ ==========
 
-@app.on_message(filters.private & ~filters.command(["start", "add_account", "my_accounts", "add_links", "select_account", "spam_start", "spam_stop", "status"]))
+@app.on_message(filters.private & ~filters.command(["start", "add_account", "my_accounts", "add_links", "add_folder", "select_account", "spam_start", "spam_stop", "status"]))
 async def handle_messages(client: Client, message: Message):
-    """Обработка входящих сообщений (для авторизации и добавления ссылок)"""
+    """Обработка входящих сообщений"""
     user_id = message.from_user.id
     
     # Проверяем состояние пользователя
@@ -417,6 +494,108 @@ async def handle_messages(client: Client, message: Message):
             )
         
         del user_sessions[user_id]
+    
+    # === ЭТАП 5: ДОБАВЛЕНИЕ ПАПКИ ===
+    elif state == "waiting_folder":
+        text = message.text.strip()
+        
+        # Разделяем название папки и сообщение
+        parts = text.split("\n\n")
+        if len(parts) < 2:
+            await message.reply_text("❌ Неправильный формат. Нужно: название папки, пустая строка, сообщение")
+            return
+        
+        folder_name = parts[0].strip()
+        spam_message = "\n\n".join(parts[1:]).strip()
+        
+        if not folder_name or not spam_message:
+            await message.reply_text("❌ Название папки или сообщение пустые")
+            return
+        
+        account_id = user_sessions[user_id].get("account_id")
+        
+        # Получаем аккаунт из БД
+        async with await init_db() as session:
+            result = await session.execute(
+                select(Account).where(Account.id == account_id)
+            )
+            account = result.scalar_one_or_none()
+        
+        if not account:
+            await message.reply_text("❌ Аккаунт не найден")
+            del user_sessions[user_id]
+            return
+        
+        # Подключаемся к аккаунту
+        try:
+            await message.reply_text(f"⏳ Получаю чаты из папки '{folder_name}'...")
+            
+            user_client = Client(
+                f"folder_{account_id}",
+                api_id=API_ID,
+                api_hash=API_HASH,
+                session_string=account.session_string
+            )
+            
+            await user_client.start()
+            
+            # Получаем чаты из папки
+            folder_chats, error = await get_chats_from_folder(user_client, folder_name)
+            
+            if error:
+                await message.reply_text(f"❌ {error}")
+                await user_client.stop()
+                del user_sessions[user_id]
+                return
+            
+            if not folder_chats:
+                await message.reply_text(f"❌ В папке '{folder_name}' нет чатов")
+                await user_client.stop()
+                del user_sessions[user_id]
+                return
+            
+            # Формируем ссылки для рассылки
+            links = []
+            for chat in folder_chats:
+                if chat['username']:
+                    links.append(f"@{chat['username']}")
+                else:
+                    # Для приватных чатов используем ID
+                    links.append(f"private:{chat['id']}")
+            
+            # Сохраняем задачу в БД
+            async with await init_db() as session:
+                task = SpamTask(
+                    user_id=user_id,
+                    account_id=account_id,
+                    links=json.dumps(links),
+                    message=spam_message,
+                    delay_min=MIN_DELAY,
+                    delay_max=MAX_DELAY,
+                    is_running=False
+                )
+                session.add(task)
+                await session.commit()
+                
+                # Показываем список найденных чатов
+                chats_list = "\n".join([f"• {chat['title']}" for chat in folder_chats[:10]])
+                if len(folder_chats) > 10:
+                    chats_list += f"\n• ... и еще {len(folder_chats) - 10} чатов"
+                
+                await message.reply_text(
+                    f"✅ Задача создана из папки '{folder_name}'!\n\n"
+                    f"Найдено чатов: {len(folder_chats)}\n"
+                    f"Первые 10:\n{chats_list}\n\n"
+                    f"Аккаунт ID: {account_id}\n\n"
+                    f"Для запуска используй /spam_start"
+                )
+            
+            await user_client.stop()
+            del user_sessions[user_id]
+            
+        except Exception as e:
+            await message.reply_text(f"❌ Ошибка при получении папки: {str(e)}")
+            del user_sessions[user_id]
 
 # ========== ОСНОВНАЯ ЛОГИКА РАССЫЛКИ ==========
 
@@ -474,22 +653,31 @@ async def run_spam_task(user_id: int, task_id: int):
                 break
             
             try:
-                # Пытаемся присоединиться к чату
-                try:
-                    chat = await user_client.join_chat(link)
-                except UserAlreadyParticipant:
-                    # Уже в чате, получаем информацию
-                    if link.startswith("https://t.me/+"):
-                        chat = await user_client.get_chat(link)
-                    else:
-                        username = link.replace("https://t.me/", "").replace("@", "")
-                        chat = await user_client.get_chat(username)
-                except InviteHashExpired:
-                    await app.send_message(user_id, f"❌ Ссылка {link} истекла")
-                    continue
-                except Exception as e:
-                    await app.send_message(user_id, f"❌ Не удалось войти в {link}: {str(e)}")
-                    continue
+                # Для приватных чатов по ID
+                if link.startswith("private:"):
+                    chat_id = int(link.replace("private:", ""))
+                    try:
+                        chat = await user_client.get_chat(chat_id)
+                    except:
+                        await app.send_message(user_id, f"❌ Не удалось получить чат {chat_id}")
+                        continue
+                else:
+                    # Пытаемся присоединиться к чату по ссылке/юзернейму
+                    try:
+                        chat = await user_client.join_chat(link)
+                    except UserAlreadyParticipant:
+                        # Уже в чате, получаем информацию
+                        if link.startswith("https://t.me/+"):
+                            chat = await user_client.get_chat(link)
+                        else:
+                            username = link.replace("https://t.me/", "").replace("@", "")
+                            chat = await user_client.get_chat(username)
+                    except InviteHashExpired:
+                        await app.send_message(user_id, f"❌ Ссылка {link} истекла")
+                        continue
+                    except Exception as e:
+                        await app.send_message(user_id, f"❌ Не удалось войти в {link}: {str(e)}")
+                        continue
                 
                 # Отправляем сообщение
                 await user_client.send_message(chat.id, task.message)
